@@ -315,6 +315,24 @@ class TestPairingStore(unittest.TestCase):
     def test_remove_nonexistent(self):
         self.assertFalse(pairing_remove("ou_nobody"))
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "chmod 0600 semantics only apply on POSIX filesystems",
+    )
+    def test_pairing_file_has_owner_only_permissions(self):
+        """pairing file stores allowlisted open_ids — must be 0600.
+
+        Leaking this list hands an attacker a ready-made targeting set of
+        users authorized to @-mention the bot on sensitive documents.
+        """
+        pairing_add("ou_sensitive_user")
+        # stat.st_mode low 9 bits are the permission bits.
+        mode = self._pairing_file.stat().st_mode & 0o777
+        self.assertEqual(
+            mode, 0o600,
+            f"pairing file permissions should be 0600, got 0o{mode:o}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

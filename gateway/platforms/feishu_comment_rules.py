@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -237,6 +239,19 @@ def _save_pairing(data: dict) -> None:
     tmp = PAIRING_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    # Restrict to owner-only rw BEFORE rename so there's never a window
+    # where the final file exists with the default umask permissions.
+    # The pairing file lists the open_ids allow-listed to @-mention the
+    # bot on documents — leaking it hands an attacker a targeting list.
+    try:
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError as e:
+        # Best-effort: on filesystems / platforms where chmod is a no-op
+        # (e.g. certain Windows setups), log and continue.  Don't block
+        # the write — correctness beats ideal permissions.
+        logger.warning(
+            "[Feishu-Rules] chmod 0600 on pairing tmp file failed: %s", e,
+        )
     tmp.replace(PAIRING_FILE)
     # Invalidate cache so next load picks up change
     _pairing_cache._mtime = 0.0

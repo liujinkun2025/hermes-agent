@@ -14,7 +14,11 @@ Flow:
        Whole -> list whole comments timeline
        Local -> list comment thread replies
   5. Build prompt (local or whole)
-  6. Create AIAgent with feishu_doc + feishu_drive tools -> agent generates reply
+  6. Run AIAgent with no feishu tools.  If the agent decides it needs
+     document text to reply, it emits a ``<NEED_DOC_READ>{...}`` sentinel;
+     business code then fetches the requested docs (from a whitelist of
+     the source doc + comment-referenced docs) and re-invokes the agent
+     with the content appended.  See ``_run_comment_agent``.
   7. Route reply:
        Whole -> add_whole_comment
        Local -> reply_to_comment (fallback to add_whole_comment on 1069302)
@@ -25,9 +29,49 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# External dependencies bundle
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommentContext:
+    """External dependencies the comment handler needs from its adapter.
+
+    Boundary dataclass: shields the handler from the concrete
+    ``FeishuAdapter`` type and its private-attribute layout.  Everything
+    the handler reads off the adapter flows through this struct, which
+    keeps the handler signature stable across adapter refactors and makes
+    tests cheaper (construct a 3-field dataclass instead of mocking an
+    adapter).
+    """
+    client: Any                     # lark_oapi client (for Feishu API calls)
+    session_store: Optional[Any]    # gateway SessionStore; may be None in
+                                    # degraded runtimes or stateless tests
+    self_open_id: str               # bot's own open_id — used to filter
+                                    # self-authored events and to strip
+                                    # routing @mentions from timeline text
+
+    @classmethod
+    def from_adapter(cls, adapter: Any, *, self_open_id: str = "") -> "CommentContext":
+        """Build a ``CommentContext`` from a live ``FeishuAdapter``.
+
+        Concentrates all ``adapter._xxx`` reads into this one method — if
+        the adapter later grows public getters, only this factory changes.
+        """
+        return cls(
+            client=adapter._client,
+            session_store=getattr(adapter, "_session_store", None),
+            self_open_id=self_open_id,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Lark SDK helpers (lazy-imported)
@@ -59,9 +103,11 @@ def _build_request(method: str, uri: str, paths=None, queries=None, body=None):
 
 async def _exec_request(client, method, uri, paths=None, queries=None, body=None):
     """Execute a lark API request and return (code, msg, data_dict)."""
-    logger.info("[Feishu-Comment] API >>> %s %s paths=%s queries=%s body=%s",
-                 method, uri, paths, queries,
-                 json.dumps(body, ensure_ascii=False)[:500] if body else None)
+    # Log metadata only — request bodies may contain user content (reply text,
+    # comment text) which must not land in persistent logs.
+    body_bytes = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) if body else 0
+    logger.info("[Feishu-Comment] API >>> %s %s paths=%s queries=%s body_bytes=%d",
+                 method, uri, paths, queries, body_bytes)
     request = _build_request(method, uri, paths, queries, body)
     response = await asyncio.to_thread(client.request, request)
 
@@ -86,12 +132,10 @@ async def _exec_request(client, method, uri, paths=None, queries=None, body=None
     logger.info("[Feishu-Comment] API <<< %s %s code=%s msg=%s data_keys=%s",
                  method, uri, code, msg, list(data.keys()) if data else "empty")
     if code != 0:
-        # Log raw response for debugging failed API calls
-        raw = getattr(response, "raw", None)
-        raw_content = ""
-        if raw and hasattr(raw, "content"):
-            raw_content = raw.content[:500] if isinstance(raw.content, (str, bytes)) else str(raw.content)[:500]
-        logger.warning("[Feishu-Comment] API FAIL raw response: %s", raw_content)
+        # Raw response bodies may echo user content back in error messages;
+        # log only the code + msg we've already extracted above.
+        logger.warning("[Feishu-Comment] API FAIL: %s %s code=%s msg=%s",
+                       method, uri, code, msg)
     return code, msg, data
 
 
@@ -275,8 +319,9 @@ async def query_document_meta(
         return {}
 
     metas = data.get("metas", [])
-    logger.debug("[Feishu-Comment] query_document_meta: raw metas type=%s value=%s",
-                 type(metas).__name__, str(metas)[:300])
+    # Don't dump metas value — entries include title and other business info.
+    logger.debug("[Feishu-Comment] query_document_meta: raw metas type=%s count=%s",
+                 type(metas).__name__, len(metas) if hasattr(metas, "__len__") else "?")
     if not metas:
         # Try alternate response shape: metas may be a dict keyed by token
         if isinstance(data.get("metas"), dict):
@@ -292,8 +337,9 @@ async def query_document_meta(
         "url": meta.get("url", ""),
         "doc_type": meta.get("doc_type", file_type),
     }
-    logger.info("[Feishu-Comment] query_document_meta: title=%s url=%s",
-                result["title"], result["url"][:80] if result["url"] else "")
+    # Title may contain business-sensitive info (e.g. project names); omit.
+    logger.info("[Feishu-Comment] query_document_meta: url=%s",
+                result["url"][:80] if result["url"] else "")
     return result
 
 
@@ -343,9 +389,12 @@ async def batch_query_comment(
     logger.debug("[Feishu-Comment] batch_query_comment: got %d items", len(items) if isinstance(items, list) else 0)
     if items and isinstance(items, list):
         item = items[0]
-        logger.info("[Feishu-Comment] batch_query_comment: is_whole=%s quote=%s reply_count=%s",
+        # quote is user content — log length only so persistent logs don't
+        # expose the quoted snippet of the document to other operators.
+        quote = item.get("quote", "") or ""
+        logger.info("[Feishu-Comment] batch_query_comment: is_whole=%s quote_len=%d reply_count=%s",
                     item.get("is_whole"),
-                    (item.get("quote", "") or "")[:60],
+                    len(quote),
                     len(item.get("reply_list", {}).get("replies", [])) if isinstance(item.get("reply_list"), dict) else "?")
         return item
     logger.warning("[Feishu-Comment] batch_query_comment: empty items, raw data keys=%s", list(data.keys()))
@@ -475,8 +524,9 @@ async def reply_to_comment(
     Returns ``(success, code)``.
     """
     text = _sanitize_comment_text(text)
-    logger.info("[Feishu-Comment] reply_to_comment: comment_id=%s text=%s",
-                comment_id, text[:100])
+    # Reply text is the agent's generated content — log length only.
+    logger.info("[Feishu-Comment] reply_to_comment: comment_id=%s text_len=%d",
+                comment_id, len(text))
     body = {
         "content": {
             "elements": [
@@ -509,8 +559,9 @@ async def add_whole_comment(
     Returns ``True`` on success.
     """
     text = _sanitize_comment_text(text)
-    logger.info("[Feishu-Comment] add_whole_comment: file_token=%s text=%s",
-                file_token, text[:100])
+    # Agent-generated content — log length only.
+    logger.info("[Feishu-Comment] add_whole_comment: file_token=%s text_len=%d",
+                file_token, len(text))
     body = {
         "file_type": file_type,
         "reply_elements": [
@@ -867,12 +918,23 @@ def _select_whole_timeline(
 
 _COMMON_INSTRUCTIONS = """
 This is a Feishu document comment thread, not an IM chat.
-Do NOT call feishu_drive_add_comment or feishu_drive_reply_comment yourself.
 Your reply will be posted automatically. Just output the reply text.
 Use the thread timeline above as the main context.
-If the quoted content is not enough, use feishu_doc_read to read nearby context.
 The quoted content is your primary anchor — insert/summarize/explain requests are about it.
 Do not guess document content you haven't read.
+
+If the quote, timeline, and referenced-document metadata above are enough,
+output the final reply directly.
+
+If you need the full text content of one or more documents to reply, output
+exactly one line in this form (JSON object) and stop — do NOT include any
+reply text in that response:
+    <NEED_DOC_READ>{"tokens": ["<doc_token_1>", "<doc_token_2>"]}
+You may only request tokens that appear in the "Current commented document"
+section or the "Referenced documents from current user comment" section
+above.  Non-docx or unknown tokens will be silently dropped.  The contents
+will be fetched and you will be asked to reply again.
+
 Reply in the same language as the user's comment unless they request otherwise.
 Use plain text only. Do not use Markdown, headings, bullet lists, tables, or code blocks.
 Do not show your reasoning process. Do not start with "I will", "Let me", or "I'll first".
@@ -896,14 +958,18 @@ def build_local_comment_prompt(
     target_index: int = -1,
     referenced_docs: str = "",
 ) -> str:
-    """Build the prompt for a local (quoted-text) comment."""
+    """Build the prompt for a local (quoted-text) comment.
+
+    All user-originated strings are passed through ``_strip_sentinel`` so a
+    malicious commenter can't inject a forged ``<NEED_DOC_READ>`` marker.
+    """
     selected = _select_local_timeline(timeline, target_index)
 
     lines = [
         f'The user added a reply in "{doc_title}".',
-        f'Current user comment text: "{_truncate(target_reply_text)}"',
-        f'Original comment text: "{_truncate(root_comment_text)}"',
-        f'Quoted content: "{_truncate(quote_text, 500)}"',
+        f'Current user comment text: "{_truncate(_strip_sentinel(target_reply_text))}"',
+        f'Original comment text: "{_truncate(_strip_sentinel(root_comment_text))}"',
+        f'Quoted content: "{_truncate(_strip_sentinel(quote_text), 500)}"',
         "This comment mentioned you (@mention is for routing, not task content).",
         f"Document link: {doc_url}",
         "Current commented document:",
@@ -916,7 +982,7 @@ def build_local_comment_prompt(
 
     for user_id, text, is_self in selected:
         marker = " <-- YOU" if is_self else ""
-        lines.append(f"[{user_id}] {_truncate(text)}{marker}")
+        lines.append(f"[{user_id}] {_truncate(_strip_sentinel(text))}{marker}")
 
     if referenced_docs:
         lines.append(referenced_docs)
@@ -939,12 +1005,16 @@ def build_whole_comment_prompt(
     nearest_self_index: int = -1,
     referenced_docs: str = "",
 ) -> str:
-    """Build the prompt for a whole-document comment."""
+    """Build the prompt for a whole-document comment.
+
+    All user-originated strings are passed through ``_strip_sentinel`` so a
+    malicious commenter can't inject a forged ``<NEED_DOC_READ>`` marker.
+    """
     selected = _select_whole_timeline(timeline, current_index, nearest_self_index)
 
     lines = [
         f'The user added a comment in "{doc_title}".',
-        f'Current user comment text: "{_truncate(comment_text)}"',
+        f'Current user comment text: "{_truncate(_strip_sentinel(comment_text))}"',
         "This is a whole-document comment.",
         "This comment mentioned you (@mention is for routing, not task content).",
         f"Document link: {doc_url}",
@@ -957,7 +1027,7 @@ def build_whole_comment_prompt(
 
     for user_id, text, is_self in selected:
         marker = " <-- YOU" if is_self else ""
-        lines.append(f"[{user_id}] {_truncate(text)}{marker}")
+        lines.append(f"[{user_id}] {_truncate(_strip_sentinel(text))}{marker}")
 
     if referenced_docs:
         lines.append(referenced_docs)
@@ -995,117 +1065,708 @@ def _resolve_model_and_runtime() -> Tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Session cache for cross-card memory within the same document
+# Session persistence (delegated to hermes's generic SessionStore)
+#
+# Comment sessions use ``chat_type="doc_comment"`` so they flow through the
+# same SessionStore pipeline as IM — inheriting daily-reset, idle-reset,
+# token tracking, and SQLite persistence automatically.
+#
+# Two scoping semantics, both keyed at the document level for ``chat_id``:
+#
+#   Local comment   thread_id = comment_id
+#     key: agent:main:feishu:doc_comment:{file_type}:{file_token}:{comment_id}
+#     Each comment thread (one root comment + its replies) is isolated.
+#
+#   Whole-doc       thread_id = _WHOLE_DOC_SENTINEL_THREAD_ID
+#     key: agent:main:feishu:doc_comment:{file_type}:{file_token}:__whole_doc__
+#     All whole-document comments on the same doc share one session —
+#     matching the semantic that whole-doc comments form a document-level
+#     discussion rather than per-thread conversations.
+#
+# user_id is deliberately not in the key: ``build_session_key`` skips
+# per-user isolation when ``thread_id`` is truthy (under the default
+# ``thread_sessions_per_user=False``), so we always route through that
+# thread-shared branch — the sentinel for whole-doc is also truthy.
+#
+# Why cross-user sharing is safe here (different from IM):
+#
+#   IM's session-per-user model exists because DMs / threads in IM carry an
+#   access boundary — user A's DM with the bot is not visible to user B.
+#   Feishu document comments have the opposite property: whole-document
+#   comments are inherently public to everyone with document access, and any
+#   bot reply is likewise visible to every participant.  Collapsing all
+#   whole-doc comments on a document onto one shared session therefore
+#   mirrors the document's native visibility — it does not leak anything
+#   across users, because nothing is private across users to begin with.
+#
+#   Consequently:
+#
+#   * No information-asymmetry risk.  A cannot "leak" to B via this session
+#     because A's comments (and the bot's replies) are already visible to B
+#     in the document itself.
+#
+#   * Cross-user context crosstalk (e.g. the agent treating A's "this part"
+#     as B's referent) is a quality concern, not a privacy concern — the
+#     prior context the agent reuses is the same content B can already see
+#     on the document.  It also matches how whole-doc threads naturally
+#     unfold: later participants pick up where the discussion left off.
+#
+#   * State churn on SessionEntry (token counts, memory_flushed,
+#     updated_at) is serialized by SessionStore._lock for a given key, so
+#     concurrent events from different users don't race on SessionEntry
+#     fields — their effect on state ordering is equivalent to interleaved
+#     turns from a single stream.
+#
+#   Local-comment threads are a different story and keep their per-
+#   comment_id isolation above.
 # ---------------------------------------------------------------------------
 
-import threading
-import time as _time
-
-_SESSION_MAX_MESSAGES = 50  # keep last N messages per document session
-_SESSION_TTL_S = 3600       # expire sessions after 1 hour of inactivity
-
-_session_cache_lock = threading.Lock()
-_session_cache: Dict[str, Dict] = {}  # key -> {"messages": [...], "last_access": float}
+# Sentinel used as thread_id for whole-document comments.  Feishu comment_id
+# values are alphanumeric strings (typically numeric), so a double-underscore
+# literal never collides with a real thread.
+_WHOLE_DOC_SENTINEL_THREAD_ID = "__whole_doc__"
 
 
-def _session_key(file_type: str, file_token: str) -> str:
-    return f"comment-doc:{file_type}:{file_token}"
+def _build_comment_session_source(
+    *,
+    file_type: str,
+    file_token: str,
+    comment_id: str,
+    is_whole_comment: bool,
+    from_open_id: str,
+    doc_title: Optional[str],
+) -> "SessionSource":
+    """Build the SessionSource identifying a comment-thread conversation.
+
+    Whole-doc comments collapse to a single document-level session via the
+    ``_WHOLE_DOC_SENTINEL_THREAD_ID`` sentinel; local comments stay
+    isolated per-thread via their ``comment_id``.
+    """
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    # Prefer a readable display name; fall back to a short token-based stub
+    # so session listings / logs remain greppable even without title info.
+    display_name = doc_title or f"{file_type}:{file_token[:8]}"
+
+    # Local: each comment card is its own session.
+    # Whole-doc: all whole comments on the doc share one session.  Using a
+    # constant sentinel (not None) keeps build_session_key on the
+    # thread-shared branch, which is what prevents user_id from entering
+    # the key under the default ``thread_sessions_per_user=False``.
+    thread_id = (
+        _WHOLE_DOC_SENTINEL_THREAD_ID if is_whole_comment else comment_id
+    )
+
+    return SessionSource(
+        platform=Platform.FEISHU,
+        chat_type="doc_comment",
+        chat_id=f"{file_type}:{file_token}",
+        chat_name=display_name,
+        thread_id=thread_id,
+        user_id=from_open_id,
+    )
 
 
-def _load_session_history(key: str) -> List[Dict[str, Any]]:
-    """Load conversation history for a document session."""
-    with _session_cache_lock:
-        entry = _session_cache.get(key)
-        if entry is None:
-            return []
-        # Check TTL
-        if _time.time() - entry["last_access"] > _SESSION_TTL_S:
-            del _session_cache[key]
-            logger.info("[Feishu-Comment] Session expired: %s", key)
-            return []
-        entry["last_access"] = _time.time()
-        return list(entry["messages"])
+def _load_comment_history(
+    session_store: Any, session_id: str,
+) -> List[Dict[str, Any]]:
+    """Load this session's prior transcript via the SessionStore public API.
+
+    Goes through ``SessionStore.load_transcript`` rather than poking
+    ``SessionStore._db`` directly.  This keeps doc_comment sessions on
+    the same storage path as IM / other chat types — in particular:
+      * JSONL is written in lockstep with SQLite (``append_to_transcript``)
+      * reads are taken from whichever of JSONL / SQLite is longer, which
+        guards against silent truncation when a session straddles the
+        SessionDB introduction (see ``load_transcript`` in gateway/session.py)
+      * future SessionStore evolutions (encryption, hooks, format changes)
+        propagate automatically, instead of letting this path drift.
+
+    Returns an empty list if the store raises for any reason — a flaky
+    transcript layer must not crash the comment handler.
+    """
+    try:
+        return session_store.load_transcript(session_id)
+    except Exception as e:
+        logger.warning(
+            "[Feishu-Comment] failed to load history for session_id=%s: %s",
+            session_id, e,
+        )
+        return []
 
 
-def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
-    """Save conversation history for a document session (keeps last N messages)."""
-    # Only keep user/assistant messages (strip system messages and tool internals)
-    cleaned = [
-        m for m in messages
-        if m.get("role") in ("user", "assistant") and m.get("content")
-    ]
-    # Keep last N
-    if len(cleaned) > _SESSION_MAX_MESSAGES:
-        cleaned = cleaned[-_SESSION_MAX_MESSAGES:]
-    with _session_cache_lock:
-        _session_cache[key] = {
-            "messages": cleaned,
-            "last_access": _time.time(),
-        }
-        logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
+def _persist_comment_turn(
+    session_store: Any,
+    session_id: str,
+    user_prompt: str,
+    assistant_reply: str,
+) -> None:
+    """Persist one user→assistant turn via the SessionStore public API.
+
+    Same rationale as ``_load_comment_history``: route through
+    ``append_to_transcript`` so doc_comment sessions share the storage
+    semantics (SQLite + JSONL dual-write, future evolution, etc.) that
+    IM and other chat types already rely on.
+
+    Only final user-visible content is stored; the two-pass sentinel
+    protocol's intermediate ``<NEED_DOC_READ>`` output and fetched-doc
+    payload are per-turn mechanics, not durable dialogue state, so they
+    are deliberately omitted to keep future prompts clean.
+    """
+    try:
+        session_store.append_to_transcript(
+            session_id, {"role": "user", "content": user_prompt},
+        )
+        session_store.append_to_transcript(
+            session_id, {"role": "assistant", "content": assistant_reply},
+        )
+    except Exception as e:
+        logger.warning(
+            "[Feishu-Comment] failed to persist turn for session_id=%s: %s",
+            session_id, e,
+        )
 
 
-def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
-    """Create an AIAgent with feishu tools and run the prompt.
+# Upper bound for persisted user-turn size.  A single comment reply shouldn't
+# be longer than this; abnormally long text is truncated with a marker so a
+# runaway input can't bloat SessionDB rows indefinitely.
+_MAX_PERSISTED_USER_TURN_CHARS = 2000
 
-    If *session_key* is provided, loads/saves conversation history for
-    cross-card memory within the same document.
 
-    Returns the agent's final response text, or empty string on failure.
+def _compact_user_turn_for_persistence(
+    *,
+    target_reply_text: str,
+    quote_text: str = "",
+) -> str:
+    """Render a compact user-turn string suitable for SessionDB persistence.
+
+    The live prompt built by ``build_local/whole_comment_prompt`` bundles
+    timeline, referenced-doc metadata, and instruction boilerplate — all
+    regenerated from fresh API data on each turn.  Persisting that full
+    prompt would duplicate the evolving timeline into every historical row
+    (O(n·k) bytes) and drown the transcript in repeated rules.
+
+    This helper keeps only:
+      * the user's actual comment text (``target_reply_text``)
+      * an optional quote marker for local comments, so future turns can
+        still resolve references like "this here" in history replay
+
+    Both user-originated fields are passed through ``_strip_sentinel``
+    before persistence.  Without this, a commenter could stash a
+    ``<NEED_DOC_READ>`` literal in one turn and have it replayed
+    unsanitized when the transcript becomes ``conversation_history`` on
+    later turns — reopening the protocol-injection surface that the
+    live-prompt path already closes.
+
+    Result is clamped to ``_MAX_PERSISTED_USER_TURN_CHARS`` with a visible
+    truncation marker — long paste events can't bloat the DB unboundedly.
+    """
+    parts: List[str] = []
+    if quote_text:
+        parts.append(f"[Quoted] {_strip_sentinel(quote_text)}")
+    if target_reply_text:
+        parts.append(_strip_sentinel(target_reply_text))
+    out = "\n".join(parts)
+
+    if len(out) > _MAX_PERSISTED_USER_TURN_CHARS:
+        logger.warning(
+            "[Feishu-Comment] persisted user turn truncated: %d → %d chars",
+            len(out), _MAX_PERSISTED_USER_TURN_CHARS,
+        )
+        out = (
+            out[:_MAX_PERSISTED_USER_TURN_CHARS]
+            + f"\n[... truncated at {_MAX_PERSISTED_USER_TURN_CHARS} chars]"
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Document-content fetch helpers (business-code equivalents of the v1
+# ``feishu_doc_read`` tool).  Callable only from this module's two-pass
+# agent orchestration — never exposed as agent tools.
+# ---------------------------------------------------------------------------
+
+_RAW_CONTENT_URI = "/open-apis/docx/v1/documents/:document_id/raw_content"
+
+# Per-document and aggregate caps.  Feishu docs can run tens of thousands of
+# characters; we truncate to keep the prompt within sane bounds.  The agent
+# is told when truncation happened (see ``_format_doc_content_block``).
+_MAX_DOC_CHARS = 30_000
+_MAX_TOTAL_DOC_CHARS = 80_000
+
+
+async def _read_document_raw_content(client: Any, document_id: str) -> str:
+    """Fetch a Feishu docx's raw plain-text content.
+
+    Raises ``RuntimeError`` on non-zero response codes so that the caller's
+    ``asyncio.gather(return_exceptions=True)`` converts failures into
+    exception objects that are rendered into prompt-visible error strings.
+    """
+    code, msg, data = await _exec_request(
+        client,
+        "GET",
+        _RAW_CONTENT_URI,
+        paths={"document_id": document_id},
+    )
+    if code != 0:
+        raise RuntimeError(f"code={code} msg={msg}")
+    return data.get("content", "") or ""
+
+
+def _truncate_doc_content(content: str, token: str) -> str:
+    """Truncate a single doc's content to ``_MAX_DOC_CHARS`` and annotate."""
+    if len(content) <= _MAX_DOC_CHARS:
+        return content
+    logger.warning(
+        "[Feishu-Comment] truncating doc %s from %d to %d chars",
+        token, len(content), _MAX_DOC_CHARS,
+    )
+    return (
+        content[:_MAX_DOC_CHARS]
+        + f"\n\n[... truncated at {_MAX_DOC_CHARS} chars;"
+        f" original length was {len(content)} chars]"
+    )
+
+
+def _enforce_total_doc_budget(
+    contents: Dict[str, str],
+) -> Dict[str, str]:
+    """Scale each doc proportionally if the aggregate exceeds the total cap.
+
+    Preserves per-token ordering.  Called after per-doc truncation, so this
+    only kicks in when many docs are requested at once.
+    """
+    total = sum(len(c) for c in contents.values())
+    if total <= _MAX_TOTAL_DOC_CHARS or total == 0:
+        return contents
+    ratio = _MAX_TOTAL_DOC_CHARS / total
+    logger.warning(
+        "[Feishu-Comment] aggregate doc content %d exceeds cap %d; scaling each by %.2f",
+        total, _MAX_TOTAL_DOC_CHARS, ratio,
+    )
+    scaled: Dict[str, str] = {}
+    for token, content in contents.items():
+        cut = int(len(content) * ratio)
+        scaled[token] = content[:cut] + "\n[... further truncated to fit aggregate cap]"
+    return scaled
+
+
+# Cap on concurrent raw_content fetches.  The whitelist already bounds N
+# (docs must appear in the current comment context), so N is usually small;
+# this semaphore is a cheap insurance against bursty fan-out triggering
+# Feishu's per-app rate limit when a comment references many docs.
+_DOC_FETCH_CONCURRENCY = 4
+
+
+async def _fetch_docs_for_agent(
+    client: Any, tokens: List[str],
+) -> Dict[str, str]:
+    """Fetch raw content for each token in parallel.
+
+    Failures are captured as prompt-ready error strings so the second
+    agent pass can still proceed (and the model knows which docs failed).
+    Results are truncated individually and then collectively.
+
+    Concurrency is capped at ``_DOC_FETCH_CONCURRENCY`` to stay friendly
+    with Feishu's rate limits even if the whitelist admits many tokens.
+    """
+    if not tokens:
+        return {}
+
+    sem = asyncio.Semaphore(_DOC_FETCH_CONCURRENCY)
+
+    async def _one(token: str) -> str:
+        async with sem:
+            try:
+                content = await _read_document_raw_content(client, token)
+            except Exception as e:
+                logger.warning(
+                    "[Feishu-Comment] doc fetch failed token=%s: %s",
+                    token, e,
+                )
+                return f"[Failed to fetch this document: {type(e).__name__}: {e}]"
+            return _truncate_doc_content(content, token)
+
+    raw = await asyncio.gather(*[_one(t) for t in tokens])
+    return _enforce_total_doc_budget(dict(zip(tokens, raw)))
+
+
+# ---------------------------------------------------------------------------
+# <NEED_DOC_READ> sentinel protocol
+#
+# Protocol: the first agent pass either outputs the final reply directly, or
+# outputs exactly one line:
+#     <NEED_DOC_READ>{"tokens": ["token_a", "token_b"]}
+# Business code parses that line, fetches the requested (and whitelisted)
+# docs, and runs a second pass with the content appended to the prompt.
+# ---------------------------------------------------------------------------
+
+# Matches the sentinel tag followed by a JSON object.  Uses DOTALL so embedded
+# newlines inside the JSON (unlikely but legal) don't break the match.
+_NEED_DOC_READ_PATTERN = re.compile(r"<NEED_DOC_READ>\s*(\{.*?\})", re.DOTALL)
+
+# Any occurrence of the bare sentinel literal — used to neutralize it inside
+# user-originated or fetched-doc text so an attacker can't forge the protocol
+# marker from within prompt-embedded content.
+_NEED_DOC_READ_LITERAL = re.compile(r"<NEED_DOC_READ>", re.IGNORECASE)
+_SENTINEL_PLACEHOLDER = "<NEED_DOC_READ_STRIPPED>"
+
+
+def _strip_sentinel(text: str) -> str:
+    """Replace any ``<NEED_DOC_READ>`` literal inside untrusted text.
+
+    Applied to every user-originated string (comment text, quotes, timeline
+    entries) and to fetched document content before they are interpolated
+    into a prompt.  This prevents an attacker who controls a comment or a
+    whitelisted doc from forging the sentinel protocol marker.
+
+    The replacement is a visible placeholder rather than an empty string so
+    that the substitution is greppable in logs if something goes wrong.
+    """
+    if not text:
+        return text
+    return _NEED_DOC_READ_LITERAL.sub(_SENTINEL_PLACEHOLDER, text)
+
+
+def _extract_effective_doc_token(link: Dict[str, Any]) -> Tuple[str, str]:
+    """Return the (effective_type, effective_token) for a referenced doc link.
+
+    After ``_resolve_wiki_nodes`` runs, wiki links carry ``resolved_type`` /
+    ``resolved_token`` pointing to the real underlying doc.  Prefer those.
+    Returns empty strings for links we couldn't resolve.
+    """
+    resolved_type = link.get("resolved_type") or ""
+    resolved_token = link.get("resolved_token") or ""
+    if resolved_type and resolved_token:
+        return resolved_type, resolved_token
+    return link.get("doc_type") or "", link.get("token") or ""
+
+
+def _build_doc_token_whitelist(
+    source_file_type: str,
+    source_file_token: str,
+    referenced_links: List[Dict[str, Any]],
+) -> Set[str]:
+    """Collect docx tokens that the agent is allowed to request for reading.
+
+    Only docx is whitelisted — the raw-content API is docx-only.  The source
+    document is whitelisted when it's docx; all referenced links that
+    resolve to docx are added as well.
+    """
+    whitelist: Set[str] = set()
+    if source_file_type == "docx" and source_file_token:
+        whitelist.add(source_file_token)
+    for link in referenced_links or []:
+        eff_type, eff_token = _extract_effective_doc_token(link)
+        if eff_type == "docx" and eff_token:
+            whitelist.add(eff_token)
+    return whitelist
+
+
+@dataclass
+class SentinelParseResult:
+    """Structured outcome of ``<NEED_DOC_READ>`` sentinel parsing.
+
+    Three mutually-exclusive states for the first-pass response:
+
+    - ``has_sentinel=False``: no sentinel literal in the response at all.
+      The response is the user-facing reply and should be delivered.
+    - ``has_sentinel=True``, ``accepted_tokens`` non-empty: the agent
+      asked for docs and the whitelist accepted at least one — the
+      caller runs the second pass.
+    - ``has_sentinel=True``, ``accepted_tokens`` empty: the agent emitted
+      a sentinel, but its payload was malformed JSON, had no ``tokens``
+      list, or every requested token was dropped by the whitelist.  The
+      caller MUST NOT return the raw first-pass response to the user —
+      it contains the sentinel literal, which is internal protocol
+      plumbing and must never be delivered.
+    """
+    has_sentinel: bool
+    accepted_tokens: List[str]
+
+
+def _parse_need_doc_read_sentinel(
+    response: str, whitelist: Set[str],
+) -> SentinelParseResult:
+    """Parse the first-pass response for a ``<NEED_DOC_READ>`` sentinel.
+
+    Detection and extraction are deliberately split so that malformed
+    variants of the marker (bare ``<NEED_DOC_READ>``, space-separated
+    token lists, marker embedded in natural-language hedging, etc.)
+    are still correctly identified as sentinel turns instead of being
+    silently treated as the final reply.
+
+    Two-step algorithm:
+
+    1. **Detection** — ``_NEED_DOC_READ_LITERAL`` (broad, case-insensitive
+       literal search).  If the marker appears anywhere in ``response``,
+       this *is* a sentinel turn, no matter what follows.  Returning
+       ``has_sentinel=False`` when the literal is present was the bug
+       that allowed the marker to leak to the user as visible text.
+
+    2. **Extraction** — ``_NEED_DOC_READ_PATTERN`` (strict, JSON-gated).
+       Only used to pull out the ``{"tokens": [...]}`` payload.  A missing
+       or malformed payload degrades to ``accepted_tokens=[]``, not to
+       ``has_sentinel=False``.
+
+    See ``SentinelParseResult`` for the three return states.  Non-whitelist
+    (including non-docx) tokens are logged and dropped so business code
+    only ever fetches docs the agent had advance knowledge of via the
+    prompt metadata.
+    """
+    # Step 1: detection — literal present anywhere?
+    if not _NEED_DOC_READ_LITERAL.search(response):
+        return SentinelParseResult(has_sentinel=False, accepted_tokens=[])
+
+    # Step 2: extraction — try to pull the JSON payload.
+    match = _NEED_DOC_READ_PATTERN.search(response)
+    if not match:
+        logger.warning(
+            "[Feishu-Comment] <NEED_DOC_READ> literal present but no JSON "
+            "payload follows (len=%d); treating as no-token sentinel",
+            len(response),
+        )
+        return SentinelParseResult(has_sentinel=True, accepted_tokens=[])
+
+    payload_raw = match.group(1)
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "[Feishu-Comment] <NEED_DOC_READ> sentinel JSON parse failed: %s (payload=%r)",
+            e, payload_raw[:200],
+        )
+        return SentinelParseResult(has_sentinel=True, accepted_tokens=[])
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, list):
+        return SentinelParseResult(has_sentinel=True, accepted_tokens=[])
+
+    accepted: List[str] = []
+    rejected: List[str] = []
+    for t in tokens:
+        if isinstance(t, str) and t in whitelist:
+            if t not in accepted:  # preserve order, drop duplicates
+                accepted.append(t)
+        else:
+            rejected.append(t)
+    if rejected:
+        logger.warning(
+            "[Feishu-Comment] Dropping %d tokens not in whitelist: %s",
+            len(rejected), rejected,
+        )
+    return SentinelParseResult(has_sentinel=True, accepted_tokens=accepted)
+
+
+def _format_doc_content_block(contents: Dict[str, str]) -> str:
+    """Render fetched doc contents for injection into the second-pass prompt.
+
+    Output deliberately forbids further ``<NEED_DOC_READ>`` on the second
+    turn: we already gave the agent everything it asked for.  Looping would
+    risk non-termination.
+
+    Doc authors can edit doc content, so the fetched body is untrusted and
+    passed through ``_strip_sentinel`` — this neutralizes forged protocol
+    markers even though business code no longer parses the sentinel on the
+    second pass (defense in depth).
+    """
+    lines = ["", "---", "Fetched document contents:"]
+    for token, content in contents.items():
+        lines.append("")
+        lines.append(f"[Document token: {token}]")
+        lines.append(_strip_sentinel(content))
+    lines.append("")
+    lines.append("---")
+    lines.append(
+        "Use the above content to generate the final reply. "
+        "You MUST produce the final user-facing reply now. "
+        "<NEED_DOC_READ> is no longer accepted in this turn."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Two-pass comment agent orchestration
+# ---------------------------------------------------------------------------
+
+
+def _build_comment_agent(runtime_kwargs: Dict[str, Any], model: str) -> Any:
+    """Construct the AIAgent used for a single comment event.
+
+    The agent is given **no feishu tools** — document content flows in via
+    the ``<NEED_DOC_READ>`` sentinel protocol, not via tool calls.
+
+    ``persist_session=False`` is critical: the durable transcript for a
+    comment thread goes through ``SessionStore.append_to_transcript`` in
+    *compact* form (user's actual reply text + optional quote anchor;
+    see ``_compact_user_turn_for_persistence``).  With the default
+    ``persist_session=True``, ``AIAgent._persist_session`` would in
+    parallel write the helper agent's full in-memory message list to
+    ``~/.hermes/logs/session_{id}.json`` and to its own SessionDB —
+    re-leaking the first-pass rendered prompt (timeline, quote, doc URL)
+    and the second-pass fetched document bodies that this module is
+    explicitly designed to keep off durable storage.
+
+    Known residual: ``AIAgent._save_session_log`` is also called directly
+    from a handful of edge paths in ``run_agent.py`` (length continuation,
+    certain retry failures) that bypass ``_persist_session`` and therefore
+    ignore this flag.  Closing that gap requires a change in
+    ``run_agent.py`` itself (making ``_save_session_log`` honour
+    ``self.persist_session``) and is deliberately out of this module's
+    scope.
     """
     from run_agent import AIAgent
 
-    logger.info("[Feishu-Comment] _run_comment_agent: injecting lark client into tool thread-locals")
-    from tools.feishu_doc_tool import set_client as set_doc_client
-    from tools.feishu_drive_tool import set_client as set_drive_client
-    set_doc_client(client)
-    set_drive_client(client)
+    return AIAgent(
+        model=model,
+        base_url=runtime_kwargs.get("base_url"),
+        api_key=runtime_kwargs.get("api_key"),
+        provider=runtime_kwargs.get("provider"),
+        api_mode=runtime_kwargs.get("api_mode"),
+        credential_pool=runtime_kwargs.get("credential_pool"),
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        # No tools are enabled; the two-pass sentinel protocol gets at most
+        # two model turns total (first pass + optional second pass after
+        # doc-content injection), so a tiny iteration budget is enough.
+        max_iterations=2,
+        enabled_toolsets=[],
+        persist_session=False,
+    )
 
+
+def _run_first_pass(
+    agent: Any, prompt: str, history: List[Dict[str, Any]],
+) -> Tuple[str, Dict[str, Any]]:
+    """First agent turn — returns (response_text, raw_result)."""
+    logger.info(
+        "[Feishu-Comment] first pass: prompt=%d chars, history=%d",
+        len(prompt), len(history),
+    )
+    result = agent.run_conversation(
+        prompt, conversation_history=history or None,
+    )
+    response = (result.get("final_response") or "").strip()
+    # Response may contain user-visible reply text or the NEED_DOC_READ
+    # sentinel; don't log its body.
+    logger.info(
+        "[Feishu-Comment] first pass done: api_calls=%d response_len=%d",
+        result.get("api_calls", 0), len(response),
+    )
+    return response, result
+
+
+def _run_second_pass(
+    agent: Any,
+    client: Any,
+    requested_tokens: List[str],
+    *,
+    prior_history: List[Dict[str, Any]],
+    first_prompt: str,
+    first_response: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Fetch requested docs and run the second agent turn.
+
+    ``AIAgent.run_conversation`` reinitializes its message list from
+    ``conversation_history`` on every call, so reusing the same agent
+    instance does NOT retain the first-pass context.  We explicitly
+    rebuild history as:
+
+        prior_history + [first_pass_user, first_pass_assistant] + doc_block
+
+    so turn 2 still sees the user's original question, quote, timeline,
+    and the agent's own prior ``<NEED_DOC_READ>`` line — the doc content
+    block alone is not enough to reply coherently.
+    """
+    logger.info(
+        "[Feishu-Comment] second pass: fetching %d docs: %s",
+        len(requested_tokens), requested_tokens,
+    )
+    doc_contents = asyncio.run(_fetch_docs_for_agent(client, requested_tokens))
+    doc_block = _format_doc_content_block(doc_contents)
+
+    second_history: List[Dict[str, Any]] = list(prior_history) + [
+        {"role": "user", "content": first_prompt},
+        {"role": "assistant", "content": first_response},
+    ]
+    result = agent.run_conversation(
+        doc_block, conversation_history=second_history,
+    )
+    response = (result.get("final_response") or "").strip()
+    logger.info(
+        "[Feishu-Comment] second pass done: api_calls=%d response_len=%d",
+        result.get("api_calls", 0), len(response),
+    )
+    return response, result
+
+
+def _run_comment_agent(
+    prompt: str,
+    client: Any,
+    doc_token_whitelist: Set[str],
+    history: List[Dict[str, Any]],
+) -> str:
+    """Run the comment agent with the two-pass sentinel protocol.
+
+    Step 1: invoke the agent with ``prompt`` and the caller-provided
+            ``history`` (already loaded from SessionStore).
+    Step 2: parse the response for ``<NEED_DOC_READ>``.  If absent, the
+            first-pass response is the final reply.
+    Step 3: if present, fetch the whitelisted tokens and run a second
+            agent turn with the doc contents appended.
+
+    Persistence is the caller's responsibility — this function returns the
+    final reply text (or empty string on failure) and leaves history I/O
+    to ``handle_drive_comment_event`` which holds the ``SessionStore``.
+    """
     try:
         model, runtime_kwargs = _resolve_model_and_runtime()
-        logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s",
-                    model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
-
-        # Load session history for cross-card memory
-        history = _load_session_history(session_key) if session_key else []
-        if history:
-            logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s",
-                        len(history), session_key)
-
-        agent = AIAgent(
-            model=model,
-            base_url=runtime_kwargs.get("base_url"),
-            api_key=runtime_kwargs.get("api_key"),
-            provider=runtime_kwargs.get("provider"),
-            api_mode=runtime_kwargs.get("api_mode"),
-            credential_pool=runtime_kwargs.get("credential_pool"),
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            max_iterations=15,
-            enabled_toolsets=["feishu_doc", "feishu_drive"],
+        logger.info(
+            "[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s history=%d",
+            model, runtime_kwargs.get("provider"),
+            (runtime_kwargs.get("base_url") or "")[:50], len(history),
         )
-        logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
-                    len(prompt), len(history))
-        result = agent.run_conversation(prompt, conversation_history=history or None)
-        response = (result.get("final_response") or "").strip()
-        api_calls = result.get("api_calls", 0)
-        logger.info("[Feishu-Comment] _run_comment_agent: done api_calls=%d response_len=%d response=%s",
-                    api_calls, len(response), response[:200])
 
-        # Save updated history
-        if session_key:
-            new_messages = result.get("messages", [])
-            if new_messages:
-                _save_session_history(session_key, new_messages)
+        agent = _build_comment_agent(runtime_kwargs, model)
 
+        # First pass
+        first_response, _ = _run_first_pass(agent, prompt, history)
+        parse = _parse_need_doc_read_sentinel(first_response, doc_token_whitelist)
+
+        if not parse.has_sentinel:
+            # No sentinel at all — first-pass response IS the final reply.
+            return first_response
+
+        if not parse.accepted_tokens:
+            # Sentinel was emitted, but its payload was malformed / had no
+            # valid tokens / every token was dropped by the whitelist.  The
+            # raw first-pass response contains the sentinel literal, which
+            # is internal protocol text — it must NEVER be delivered to the
+            # user.  Coerce to the NO_REPLY path by returning "".
+            logger.warning(
+                "[Feishu-Comment] first-pass emitted <NEED_DOC_READ> but no "
+                "tokens survived parse/whitelist — dropping first-pass output "
+                "to prevent protocol leak (response_len=%d)",
+                len(first_response),
+            )
+            return ""
+
+        # Second pass: doc contents requested.  Pass the first-pass prompt
+        # and response so ``_run_second_pass`` can explicitly reconstruct
+        # ``conversation_history`` — otherwise turn 2 loses the user's
+        # original question, quote, and timeline.
+        response, _ = _run_second_pass(
+            agent, client, parse.accepted_tokens,
+            prior_history=history,
+            first_prompt=prompt,
+            first_response=first_response,
+        )
         return response
+
     except Exception as e:
-        logger.exception("[Feishu-Comment] _run_comment_agent: agent failed: %s", e)
+        logger.exception("[Feishu-Comment] _run_comment_agent failed: %s", e)
         return ""
-    finally:
-        set_doc_client(None)
-        set_drive_client(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,21 +1776,75 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
 _NO_REPLY_SENTINEL = "NO_REPLY"
 
 
+def _gate_outbound_reply(response: Optional[str]) -> Optional[str]:
+    """Single gate for any text about to be posted back to Feishu.
+
+    Invariant this function enforces:
+        *The returned string, if non-None, never contains the*
+        ``<NEED_DOC_READ>`` *literal and is not the* ``NO_REPLY`` *signal.*
+
+    Every delivery path must funnel its agent-produced text through this
+    gate.  Adding a new delivery path without calling it re-opens the
+    leak window this module has closed repeatedly — the historical bugs
+    all followed the pattern "spot a new malformed-marker variant, add a
+    new regex check".  Centralising the guarantee as a single boolean
+    invariant (literal-in-text → refuse) means every future variant is
+    covered without adding another regex.
+
+    Returns:
+        The ``response`` unchanged when it is safe to deliver, or
+        ``None`` meaning "skip delivery".  ``None`` is returned when:
+
+        * the response is empty / whitespace only;
+        * the response contains the ``NO_REPLY`` sentinel (agent chose
+          not to reply);
+        * the response contains the ``<NEED_DOC_READ>`` literal anywhere
+          (a malformed sentinel escaped parsing, or the second pass
+          ignored the "no more sentinel" instruction).  Refusing to
+          deliver is strictly safer than shipping a half-formed marker
+          to the comment thread.
+    """
+    if not response:
+        return None
+    stripped = response.strip()
+    if not stripped:
+        return None
+    if _NO_REPLY_SENTINEL in response:
+        return None
+    if _NEED_DOC_READ_LITERAL.search(response):
+        logger.error(
+            "[Feishu-Comment] Refusing delivery: response contains "
+            "<NEED_DOC_READ> literal (len=%d)",
+            len(response),
+        )
+        return None
+    return response
+
+
 _ALLOWED_NOTICE_TYPES = {"add_comment", "add_reply"}
 
 
 async def handle_drive_comment_event(
-    client: Any, data: Any, *, self_open_id: str = "",
+    ctx: CommentContext, data: Any,
 ) -> None:
     """Full orchestration for a drive comment event.
+
+    *ctx* bundles the lark client, the gateway SessionStore, and the bot's
+    own open_id (see ``CommentContext``).  The caller constructs it via
+    ``CommentContext.from_adapter(adapter, self_open_id=...)``; the handler
+    itself never touches adapter internals.
 
     1. Parse event + filter (self-reply, notice_type)
     2. Add OK reaction
     3. Fetch doc meta + comment details in parallel
     4. Branch on is_whole: build timeline
-    5. Build prompt, run agent
-    6. Deliver reply
+    5. Build prompt, run agent (history from SessionStore)
+    6. Deliver reply + persist user/assistant turn to SessionStore
     """
+    client = ctx.client
+    session_store = ctx.session_store
+    self_open_id = ctx.self_open_id
+
     logger.info("[Feishu-Comment] ========== handle_drive_comment_event START ==========")
     parsed = parse_drive_comment_event(data)
     if parsed is None:
@@ -1144,8 +1859,9 @@ async def handle_drive_comment_event(
     from_open_id = parsed["from_open_id"]
     to_open_id = parsed["to_open_id"]
     notice_type = parsed["notice_type"]
+    is_mentioned = parsed["is_mentioned"]
 
-    # Filter: self-reply, receiver check, notice_type
+    # Filter: self-reply, receiver check, notice_type, is_mentioned.
     if from_open_id and self_open_id and from_open_id == self_open_id:
         logger.debug("[Feishu-Comment] Skipping self-authored event: from=%s", from_open_id)
         return
@@ -1154,6 +1870,17 @@ async def handle_drive_comment_event(
         return
     if notice_type and notice_type not in _ALLOWED_NOTICE_TYPES:
         logger.debug("[Feishu-Comment] Skipping notice_type=%s", notice_type)
+        return
+    # ``is_mentioned`` is the authoritative signal that the user explicitly
+    # @-ed the bot.  Without this gate, any comment on a document the bot
+    # was previously invited to (and any reply in a thread the bot
+    # participated in) would route here — a noisy, privacy-adverse
+    # behavior.  Drop events that lack an explicit mention.
+    if not is_mentioned:
+        logger.debug(
+            "[Feishu-Comment] Skipping unmentioned event: comment=%s from=%s",
+            comment_id, from_open_id,
+        )
         return
     if not file_token or not file_type or not comment_id:
         logger.warning("[Feishu-Comment] Missing required fields, skipping")
@@ -1252,9 +1979,10 @@ async def handle_drive_comment_event(
                     current_index = i
                     break
 
-        logger.info("[Feishu-Comment] Whole timeline: %d entries, current_idx=%d, self_idx=%d, text=%s",
+        # current_text is the user's comment; log indices and length only.
+        logger.info("[Feishu-Comment] Whole timeline: %d entries, current_idx=%d, self_idx=%d, current_len=%d",
                     len(timeline), current_index, nearest_self_index,
-                    current_text[:80] if current_text else "(empty)")
+                    len(current_text) if current_text else 0)
 
         # Extract and resolve document links from all replies
         all_raw_replies = []
@@ -1283,6 +2011,11 @@ async def handle_drive_comment_event(
             nearest_self_index=nearest_self_index,
             referenced_docs=ref_docs_text,
         )
+        # Persistence-only view: just the user's current whole-doc comment
+        # text.  Whole-doc has no per-anchor quote, so the quote segment is
+        # empty.
+        persist_user_text = current_text
+        persist_quote_text = ""
 
     else:
         # Local comment: fetch the comment thread replies
@@ -1317,11 +2050,13 @@ async def handle_drive_comment_event(
                     target_index = i
                     break
 
-        logger.info("[Feishu-Comment] Local timeline: %d entries, target_idx=%d, quote=%s root=%s target=%s",
+        # quote/root/target are user/agent content — log lengths only.
+        logger.info("[Feishu-Comment] Local timeline: %d entries, target_idx=%d, "
+                    "quote_len=%d root_len=%d target_len=%d",
                     len(timeline), target_index,
-                    quote_text[:60] if quote_text else "(empty)",
-                    root_text[:60] if root_text else "(empty)",
-                    target_text[:60] if target_text else "(empty)")
+                    len(quote_text) if quote_text else 0,
+                    len(root_text) if root_text else 0,
+                    len(target_text) if target_text else 0)
 
         # Extract and resolve document links from replies
         doc_links = _extract_docs_links(replies)
@@ -1343,41 +2078,107 @@ async def handle_drive_comment_event(
             target_index=target_index,
             referenced_docs=ref_docs_text,
         )
+        # Persistence-only view: the user's actual reply text plus the
+        # quote they anchored to (if any).  Everything else in ``prompt``
+        # (timeline, referenced-doc metadata, instructions) is rebuilt
+        # from fresh API data on each turn and must not enter history.
+        persist_user_text = target_text
+        persist_quote_text = quote_text
 
+    # Prompt contains the full quote + timeline — never log its content, even
+    # at DEBUG, because agent.log's per-level threshold is configurable and a
+    # misconfigured deployment would expose user comments to any log reader.
     logger.info("[Feishu-Comment] [Step 4/5] Prompt built (%d chars), running agent...", len(prompt))
-    logger.debug("[Feishu-Comment] Full prompt:\n%s", prompt)
 
-    # Step 4: Run agent in a thread (run_conversation is synchronous)
-    # Session key groups all comment cards on the same document
-    sess_key = _session_key(file_type, file_token)
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None, _run_comment_agent, prompt, client, sess_key,
+    # Build the whitelist of document tokens the agent may request via the
+    # <NEED_DOC_READ> sentinel: the source document (if docx) plus any
+    # referenced docs resolved to docx.  Non-docx tokens cannot be read via
+    # the raw_content API, so we never whitelist them.
+    doc_token_whitelist = _build_doc_token_whitelist(
+        file_type, file_token, doc_links,
     )
 
-    if not response or _NO_REPLY_SENTINEL in response:
-        logger.info("[Feishu-Comment] Agent returned NO_REPLY, skipping delivery")
+    # Resolve the per-comment-thread session via hermes's generic SessionStore.
+    # Falls back to a stateless turn (history=[]) if the gateway didn't wire
+    # a session_store into the adapter — this keeps tests and degraded
+    # runtimes working without crashing.
+    session_entry = None
+    history: List[Dict[str, Any]] = []
+    if session_store is not None:
+        source = _build_comment_session_source(
+            file_type=file_type,
+            file_token=file_token,
+            comment_id=comment_id,
+            is_whole_comment=is_whole,
+            from_open_id=from_open_id,
+            doc_title=doc_title,
+        )
+        session_entry = session_store.get_or_create_session(source)
+        history = _load_comment_history(session_store, session_entry.session_id)
+        logger.info(
+            "[Feishu-Comment] session resolved: key=%s id=%s history=%d",
+            session_entry.session_key, session_entry.session_id, len(history),
+        )
     else:
-        logger.info("[Feishu-Comment] Agent response (%d chars): %s", len(response), response[:200])
+        logger.info(
+            "[Feishu-Comment] no session_store on adapter — running stateless turn",
+        )
+
+    # Step 4: Run agent in a thread (run_conversation is synchronous).
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None, _run_comment_agent, prompt, client, doc_token_whitelist, history,
+    )
+
+    # Funnel the agent's response through the single outbound gate.  The
+    # gate enforces the invariant "delivered text never contains the
+    # <NEED_DOC_READ> literal and is not NO_REPLY" — see
+    # ``_gate_outbound_reply`` for why this is the one place to check.
+    delivery_text = _gate_outbound_reply(response)
+
+    if delivery_text is None:
+        logger.info("[Feishu-Comment] No reply delivered (empty / NO_REPLY / gated)")
+    else:
+        # Agent response is the final user-visible reply — log length only.
+        logger.info("[Feishu-Comment] Agent response: %d chars", len(delivery_text))
 
         # Step 5: Deliver reply
         logger.info("[Feishu-Comment] [Step 5/5] Delivering reply (is_whole=%s, comment_id=%s)", is_whole, comment_id)
         success = await deliver_comment_reply(
-            client, file_token, file_type, comment_id, response, is_whole,
+            client, file_token, file_type, comment_id, delivery_text, is_whole,
         )
         if success:
             logger.info("[Feishu-Comment] Reply delivered successfully")
+            # Persist only on successful delivery: a failed delivery means the
+            # user never saw the reply, so treating it as "didn't happen" in
+            # the transcript avoids confusing future turns.
+            if session_entry is not None and session_store is not None:
+                # Persist only the semantic payload, not the full rendered
+                # prompt — see ``_compact_user_turn_for_persistence``.
+                user_turn = _compact_user_turn_for_persistence(
+                    target_reply_text=persist_user_text,
+                    quote_text=persist_quote_text,
+                )
+                _persist_comment_turn(
+                    session_store, session_entry.session_id,
+                    user_prompt=user_turn, assistant_reply=delivery_text,
+                )
         else:
             logger.error("[Feishu-Comment] Failed to deliver reply")
 
-    # Cleanup: remove OK reaction (best-effort, non-blocking)
+    # Cleanup: remove OK reaction (best-effort, fire-and-forget).
+    # Mirrors the add-reaction call at the start of the handler — we don't
+    # want this extra round-trip to Feishu to hold the event loop when the
+    # reply has already been delivered.
     if reply_id:
-        await delete_comment_reaction(
-            client,
-            file_token=file_token,
-            file_type=file_type,
-            reply_id=reply_id,
-            reaction_type="OK",
+        asyncio.ensure_future(
+            delete_comment_reaction(
+                client,
+                file_token=file_token,
+                file_type=file_type,
+                reply_id=reply_id,
+                reaction_type="OK",
+            )
         )
 
     logger.info("[Feishu-Comment] ========== handle_drive_comment_event END ==========")

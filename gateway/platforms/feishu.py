@@ -2039,14 +2039,22 @@ class FeishuAdapter(BasePlatformAdapter):
         logging, and reaction.  Scheduling follows the same
         ``run_coroutine_threadsafe`` pattern used by ``_on_message_event``.
         """
-        from gateway.platforms.feishu_comment import handle_drive_comment_event
+        from gateway.platforms.feishu_comment import (
+            CommentContext,
+            handle_drive_comment_event,
+        )
 
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
             logger.warning("[Feishu] Dropping drive comment event before adapter loop is ready")
             return
+        # Build the handler's dependency bundle here so the handler signature
+        # stays independent of the concrete ``FeishuAdapter`` type.  All
+        # ``_client`` / ``_session_store`` reads are localized to
+        # ``CommentContext.from_adapter``.
+        ctx = CommentContext.from_adapter(self, self_open_id=self._bot_open_id)
         future = asyncio.run_coroutine_threadsafe(
-            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
+            handle_drive_comment_event(ctx, data),
             loop,
         )
         future.add_done_callback(self._log_background_failure)
