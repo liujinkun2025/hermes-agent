@@ -37,7 +37,7 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import Any, Callable, Dict, List, Optional
 from openai import OpenAI
 import fire
 from datetime import datetime
@@ -719,6 +719,7 @@ class AIAgent:
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        extra_tools: Optional[List[Dict[str, Any]]] = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -776,6 +777,20 @@ class AIAgent:
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
+            extra_tools (List[Dict]): Per-agent tool specs bound to this AIAgent
+                instance only (not registered globally).  Each spec is
+                ``{"schema": <openai-format function schema>, "handler":
+                <callable(args: dict) -> str>}``.  Schemas merge into
+                ``self.tools`` so the model sees them; handlers live in
+                ``self._extra_tool_handlers`` and are dispatched before the
+                global registry fallback but after hard-coded built-ins
+                (todo/memory/clarify/delegate_task/session_search), so
+                extra_tools can augment an agent without shadowing them.
+                Generalizes the existing memory-provider tool-injection
+                pattern into a first-class parameter.  Useful for
+                domain-specific tools (Feishu doc reader, RL training,
+                Home Assistant) and for handlers that need to close over
+                runtime state (API client, per-event whitelist).
             save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
             verbose_logging (bool): Enable verbose logging for debugging (default: False)
             quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
@@ -1304,7 +1319,38 @@ class AIAgent:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
-        
+
+        # Per-agent extra tools: merge schemas into ``self.tools`` so the
+        # model sees them, and index handlers on the instance for dispatch.
+        # Follows the same shape as the memory-provider injection below
+        # (lines ~1408-1422) but parameterised.
+        self._extra_tool_handlers: Dict[str, Callable] = {}
+        if extra_tools:
+            _existing = {
+                t.get("function", {}).get("name")
+                for t in (self.tools or [])
+                if isinstance(t, dict)
+            }
+            for spec in extra_tools:
+                schema = spec["schema"]
+                name = schema["name"]
+                if name in _existing:
+                    # Do not shadow an already-registered tool of the same
+                    # name — global registry and built-ins take precedence.
+                    logger.warning(
+                        "extra_tools: skipping %r — already provided by registry/built-ins",
+                        name,
+                    )
+                    continue
+                self._extra_tool_handlers[name] = spec["handler"]
+                self.tools = (self.tools or []) + [
+                    {"type": "function", "function": schema}
+                ]
+                self.valid_tool_names.add(name)
+                _existing.add(name)
+            if self._extra_tool_handlers and not self.quiet_mode:
+                print(f"   ➕ extra_tools: {', '.join(sorted(self._extra_tool_handlers))}")
+
         # Check tool requirements
         if self.tools and not self.quiet_mode:
             requirements = check_toolset_requirements()
@@ -7616,6 +7662,13 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+        elif function_name in self._extra_tool_handlers:
+            # Per-agent extra tool dispatch.  Positioned after the hard-
+            # coded built-ins above so extra_tools cannot shadow critical
+            # agent-level surfaces (todo/memory/clarify/delegate_task/
+            # session_search); positioned before the registry fallback
+            # below so extra_tools don't need to be globally registered.
+            return self._extra_tool_handlers[function_name](function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
